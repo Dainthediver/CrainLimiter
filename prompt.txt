@@ -1,0 +1,13 @@
+**Role / Perspective:**  
+Act as a C++ developer.
+**Audience:**  
+Write instructions for a developer using Visual Studio Code with PlatformIO, and a basic knowledge of Github.
+**Goal / Outcome:**  
+Your objective is to help me write functions that will allow an ESP32 to control a DW1000 BU-01 chip. After initializing the chip, several functions will be needed. 
+ *Function 1* linked devices - Each DW1000 BU01 can be linked to up to five others on the same channel. Each chip will need to have its own unique device number, and a priority of 1 through 5. 
+ *Function 2* agreed distance measurement - Each DW1000 BU01 will attempt to measure its distance to another chip on the same channel. This will need to have several constraints, and be very well orchestrated. Each unit will start with a handshake saying they are both available. Basically device one to device two, are you open. Device two to device one, yes I am open. Now both device enters a linked mode and ignore other requests. The linked devices perform a distance measurement. The device with the lower number starts, sends a ping to device two, and measures the return. Next device two sends a ping and measures the distance. This is performed 16 times. Then each device averages all the measurements and stores value in a variable called distanceToDeviceX with "x" being the device number. Now the devices will unlink and repeat the process with any other devices on the channel excluding the devices it has already linked to, until a timer expires, then it will listen for any devices again. 
+**Format:**  
+Present the output as c++ comment a lot so it is easy to see how the code works.
+**Constraints / Rules:**  
+Follow these requirements:  
+Use any libraries that may work found on GitHub, but you must copy and paste the exact code. then in the line comment the web address of the code.

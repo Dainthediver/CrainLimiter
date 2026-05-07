@@ -33,6 +33,40 @@
 #define LISTEN_PERIOD_MS 10000    // How long to listen for new devices
 
 // ============================================================================
+// DW1000 UWB CONFIGURATION
+// ============================================================================
+// UWB Channel Selection (1, 2, 3, 4, 5, or 7)
+// Channel 5: 6.5 GHz center frequency, good for long range
+#define UWB_CHANNEL 5
+
+// Preamble Length (symbols)
+// Options: 64, 128, 256, 1024, 2048, 4096
+// Longer preamble = better range but slower acquisition
+#define PREAMBLE_LENGTH 1024
+
+// Pulse Repetition Frequency (PRF)
+// Options: 16 MHz or 64 MHz
+// 64 MHz provides better ranging accuracy
+#define PRF 64
+
+// Data Rate (kbps)
+// Options: 110, 850, 6800
+// Lower data rate = longer range
+#define DATA_RATE 110
+
+// Transmit Power
+// Options: See DW1000 datasheet for power levels
+// Higher power = longer range but more power consumption
+#define TX_POWER 0x254085A0  // Example: ~-14 dBm, adjust for your hardware
+
+// Antenna Delay (in DW1000 time units, ~15.65 ps per unit)
+// CRITICAL FOR ACCURATE DISTANCE MEASUREMENT!
+// This value MUST be calibrated for your specific hardware setup
+// Typical range: 16384-32768 (depends on antenna, PCB trace length, etc.)
+// To calibrate: Measure known distance, adjust this value until reading is accurate
+#define ANTENNA_DELAY 16384  // STARTING VALUE - MUST BE CALIBRATED!
+
+// ============================================================================
 // MESSAGE TYPES - Protocol for device communication
 // ============================================================================
 #define MSG_HANDSHAKE_REQUEST  0x01  // "Are you available?"
@@ -278,9 +312,66 @@ void initializeDW1000() {
     // Function from DW1000.h: newConfiguration()
     DW1000.newConfiguration();
     
-    // Set default configuration parameters
-    // Function from DW1000.h: setDefaults()
-    DW1000.setDefaults();
+    // Set UWB Channel (1, 2, 3, 4, 5, or 7)
+    // Channel 5: 6.5 GHz, good for long range applications
+    DW1000.setChannel(UWB_CHANNEL);
+    
+    // Set Preamble Length
+    // Longer preamble = better range but slower acquisition
+    // Options: DW1000.PLEN_64, PLEN_128, PLEN_256, PLEN_1024, PLEN_2048, PLEN_4096
+    switch(PREAMBLE_LENGTH) {
+        case 64:
+            DW1000.setPreambleLength(DW1000.PLEN_64);
+            break;
+        case 128:
+            DW1000.setPreambleLength(DW1000.PLEN_128);
+            break;
+        case 256:
+            DW1000.setPreambleLength(DW1000.PLEN_256);
+            break;
+        case 1024:
+            DW1000.setPreambleLength(DW1000.PLEN_1024);
+            break;
+        case 2048:
+            DW1000.setPreambleLength(DW1000.PLEN_2048);
+            break;
+        case 4096:
+            DW1000.setPreambleLength(DW1000.PLEN_4096);
+            break;
+        default:
+            DW1000.setPreambleLength(DW1000.PLEN_1024);
+    }
+    
+    // Set Pulse Repetition Frequency (PRF)
+    // 64 MHz provides better ranging accuracy than 16 MHz
+    // Options: DW1000.TX_POW_18DB (16 MHz) or TX_POW_12DB (64 MHz)
+    if (PRF == 64) {
+        DW1000.setPRF(DW1000.TX_POW_12DB);  // 64 MHz PRF
+    } else {
+        DW1000.setPRF(DW1000.TX_POW_18DB);  // 16 MHz PRF
+    }
+    
+    // Set Data Rate
+    // Lower data rate = longer range but slower communication
+    // Options: DW1000.TX_POW_18DB (110 kbps), TX_POW_12DB (850 kbps), TX_POW_6DB (6.8 Mbps)
+    switch(DATA_RATE) {
+        case 110:
+            DW1000.setDataRate(DW1000.TX_POW_18DB);
+            break;
+        case 850:
+            DW1000.setDataRate(DW1000.TX_POW_12DB);
+            break;
+        case 6800:
+            DW1000.setDataRate(DW1000.TX_POW_6DB);
+            break;
+        default:
+            DW1000.setDataRate(DW1000.TX_POW_18DB);
+    }
+    
+    // Set Transmit Power
+    // Adjust based on your hardware and regulatory requirements
+    // Format: 0xXXXXXXXX (see DW1000 datasheet for power register values)
+    DW1000.setTxPower(TX_POWER);
     
     // Set this device's address (using device number)
     // Function from DW1000.h: setDeviceAddress(int16_t val)
@@ -289,6 +380,12 @@ void initializeDW1000() {
     // Set network ID (all devices on same network should use same ID)
     // Function from DW1000.h: setNetworkId(int16_t val)
     DW1000.setNetworkId(10);
+    
+    // Set Antenna Delay - CRITICAL FOR ACCURATE DISTANCE MEASUREMENT!
+    // This compensates for signal delay through antenna and PCB traces
+    // MUST be calibrated for your specific hardware setup
+    // Function from DW1000.h: setAntennaDelay(uint16_t value)
+    DW1000.setAntennaDelay(ANTENNA_DELAY);
     
     // Enable mode for long range, low power operation
     // Modes defined in DW1000.h:
@@ -320,6 +417,18 @@ void initializeDW1000() {
     DW1000.startReceive();
     
     Serial.println("DW1000 initialized successfully");
+    Serial.print("Configuration: Channel ");
+    Serial.print(UWB_CHANNEL);
+    Serial.print(", Preamble ");
+    Serial.print(PREAMBLE_LENGTH);
+    Serial.print(", PRF ");
+    Serial.print(PRF);
+    Serial.print(" MHz, Data Rate ");
+    Serial.print(DATA_RATE);
+    Serial.println(" kbps");
+    Serial.print("Antenna Delay: ");
+    Serial.print(ANTENNA_DELAY);
+    Serial.println(" (CALIBRATE THIS VALUE!)");
 }
 
 // ============================================================================
@@ -1025,14 +1134,82 @@ void printDistances() {
  * 
  * Problem: "No messages received"
  * Solution: Ensure both devices on same network ID (line with setNetworkId)
+ *           Ensure both devices use same UWB channel
  * 
  * Problem: "Distance measurements are wildly inaccurate"
- * Solution: Ensure good antenna connection, check for interference
- *           Calibrate using known distances
+ * Solution: CALIBRATE ANTENNA DELAY! (see below)
+ *           Ensure good antenna connection, check for interference
  * 
  * Problem: "Handshake timeout"
  * Solution: Check that devices have different device numbers
  *           Ensure devices are within range (usually <100m line of sight)
+ * 
+ * ============================================================================
+ * ANTENNA DELAY CALIBRATION (CRITICAL FOR ACCURACY!)
+ * ============================================================================
+ * 
+ * The ANTENNA_DELAY value compensates for signal delay through your antenna
+ * and PCB traces. Without proper calibration, distance measurements will be
+ * consistently off by several meters.
+ * 
+ * CALIBRATION PROCEDURE:
+ * 
+ * 1. Set up two devices at a KNOWN distance (e.g., exactly 1.0 meter apart)
+ * 2. Upload the code with ANTENNA_DELAY = 16384 (starting value)
+ * 3. Let devices measure distance and record the reading
+ * 4. Calculate error: Error = Measured Distance - Actual Distance
+ * 5. Adjust ANTENNA_DELAY:
+ *    - If reading is TOO HIGH: Decrease ANTENNA_DELAY
+ *    - If reading is TOO LOW: Increase ANTENNA_DELAY
+ * 6. Typical adjustment: ~500 units per meter of error
+ * 7. Repeat until reading is within 10cm of actual distance
+ * 8. Test at multiple distances (1m, 5m, 10m) to verify linearity
+ * 
+ * EXAMPLE:
+ * - Actual distance: 1.0 meter
+ * - Measured distance: 1.5 meters (0.5m too high)
+ * - Error: +0.5 meters
+ * - Adjustment: 0.5 * 500 = 250 units
+ * - New ANTENNA_DELAY: 16384 - 250 = 16134
+ * 
+ * NOTES:
+ * - Each hardware setup (antenna, PCB, connectors) needs unique calibration
+ * - Calibrate with the same antenna and cable you'll use in production
+ * - Temperature can affect calibration slightly
+ * - Store calibrated value per device (they may differ slightly)
+ * 
+ * ============================================================================
+ * UWB CHANNEL SELECTION GUIDE
+ * ============================================================================
+ * 
+ * Channel 1: 3.5 GHz - Short range, good for indoor use
+ * Channel 2: 3.9 GHz - Short range, alternative to Ch1
+ * Channel 3: 4.3 GHz - Medium range
+ * Channel 4: 4.7 GHz - Medium range
+ * Channel 5: 6.5 GHz - Long range, best for outdoor (RECOMMENDED)
+ * Channel 7: 6.5 GHz - Long range, alternative to Ch5
+ * 
+ * For CrainLimiter: Use Channel 5 for maximum range (100-200m line of sight)
+ * 
+ * ============================================================================
+ * CONFIGURATION TRADE-OFFS
+ * ============================================================================
+ * 
+ * RANGE vs. SPEED:
+ * - Longer preamble (4096) = Better range, slower acquisition
+ * - Shorter preamble (64) = Faster acquisition, shorter range
+ * 
+ * ACCURACY vs. POWER:
+ * - 64 MHz PRF = Better accuracy, more power consumption
+ * - 16 MHz PRF = Lower power, slightly less accurate
+ * 
+ * RANGE vs. DATA RATE:
+ * - 110 kbps = Maximum range, slow communication
+ * - 6.8 Mbps = Shorter range, fast communication
+ * 
+ * RECOMMENDED FOR CRAINLIMITER:
+ * - Channel 5, Preamble 1024, PRF 64 MHz, Data Rate 110 kbps
+ * - This provides good balance of range, accuracy, and power consumption
  * 
  * ============================================================================
  */

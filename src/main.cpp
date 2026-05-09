@@ -318,28 +318,32 @@ void initializeDW1000() {
     
     // Set Preamble Length
     // Longer preamble = better range but slower acquisition
-    // Options: DW1000.PLEN_64, PLEN_128, PLEN_256, PLEN_1024, PLEN_2048, PLEN_4096
+    // Options: TX_PREAMBLE_LEN_64, TX_PREAMBLE_LEN_128, TX_PREAMBLE_LEN_256,
+    //           TX_PREAMBLE_LEN_512, TX_PREAMBLE_LEN_1024, TX_PREAMBLE_LEN_2048, TX_PREAMBLE_LEN_4096
     switch(PREAMBLE_LENGTH) {
         case 64:
-            DW1000.setPreambleLength(DW1000.PLEN_64);
+            DW1000.setPreambleLength(DW1000.TX_PREAMBLE_LEN_64);
             break;
         case 128:
-            DW1000.setPreambleLength(DW1000.PLEN_128);
+            DW1000.setPreambleLength(DW1000.TX_PREAMBLE_LEN_128);
             break;
         case 256:
-            DW1000.setPreambleLength(DW1000.PLEN_256);
+            DW1000.setPreambleLength(DW1000.TX_PREAMBLE_LEN_256);
+            break;
+        case 512:
+            DW1000.setPreambleLength(DW1000.TX_PREAMBLE_LEN_512);
             break;
         case 1024:
-            DW1000.setPreambleLength(DW1000.PLEN_1024);
+            DW1000.setPreambleLength(DW1000.TX_PREAMBLE_LEN_1024);
             break;
         case 2048:
-            DW1000.setPreambleLength(DW1000.PLEN_2048);
+            DW1000.setPreambleLength(DW1000.TX_PREAMBLE_LEN_2048);
             break;
         case 4096:
-            DW1000.setPreambleLength(DW1000.PLEN_4096);
+            DW1000.setPreambleLength(DW1000.TX_PREAMBLE_LEN_4096);
             break;
         default:
-            DW1000.setPreambleLength(DW1000.PLEN_1024);
+            DW1000.setPreambleLength(DW1000.TX_PREAMBLE_LEN_1024);
     }
     
     // Set Pulse Repetition Frequency (PRF)

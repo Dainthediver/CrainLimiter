@@ -54,11 +54,6 @@
 // Lower data rate = longer range
 #define DATA_RATE 110
 
-// Transmit Power
-// Options: See DW1000 datasheet for power levels
-// Higher power = longer range but more power consumption
-#define TX_POWER 0x254085A0  // Example: ~-14 dBm, adjust for your hardware
-
 // Antenna Delay (in DW1000 time units, ~15.65 ps per unit)
 // CRITICAL FOR ACCURATE DISTANCE MEASUREMENT!
 // This value MUST be calibrated for your specific hardware setup
@@ -313,8 +308,8 @@ void initializeDW1000() {
     DW1000.newConfiguration();
     
     // Set UWB Channel (1, 2, 3, 4, 5, or 7)
-    // Channel 5: 6.5 GHz, good for long range applications
-    DW1000.setChannel(UWB_CHANNEL);
+    // Channel 5: 6.5 GHz center frequency, good for long range applications
+    DW1000.setChannel(DW1000.CHANNEL_5);
     
     // Set Preamble Length
     // Longer preamble = better range but slower acquisition
@@ -348,34 +343,34 @@ void initializeDW1000() {
     
     // Set Pulse Repetition Frequency (PRF)
     // 64 MHz provides better ranging accuracy than 16 MHz
-    // Options: DW1000.TX_POW_18DB (16 MHz) or TX_POW_12DB (64 MHz)
+    // Options: TX_PULSE_FREQ_16MHZ (more power efficient) or TX_PULSE_FREQ_64MHZ (better accuracy)
     if (PRF == 64) {
-        DW1000.setPRF(DW1000.TX_POW_12DB);  // 64 MHz PRF
+        DW1000.setPulseFrequency(DW1000.TX_PULSE_FREQ_64MHZ);  // 64 MHz PRF
     } else {
-        DW1000.setPRF(DW1000.TX_POW_18DB);  // 16 MHz PRF
+        DW1000.setPulseFrequency(DW1000.TX_PULSE_FREQ_16MHZ);  // 16 MHz PRF
     }
     
     // Set Data Rate
     // Lower data rate = longer range but slower communication
-    // Options: DW1000.TX_POW_18DB (110 kbps), TX_POW_12DB (850 kbps), TX_POW_6DB (6.8 Mbps)
+    // Options: TRX_RATE_110KBPS, TRX_RATE_850KBPS, TRX_RATE_6800KBPS
     switch(DATA_RATE) {
         case 110:
-            DW1000.setDataRate(DW1000.TX_POW_18DB);
+            DW1000.setDataRate(DW1000.TRX_RATE_110KBPS);
             break;
         case 850:
-            DW1000.setDataRate(DW1000.TX_POW_12DB);
+            DW1000.setDataRate(DW1000.TRX_RATE_850KBPS);
             break;
         case 6800:
-            DW1000.setDataRate(DW1000.TX_POW_6DB);
+            DW1000.setDataRate(DW1000.TRX_RATE_6800KBPS);
             break;
         default:
-            DW1000.setDataRate(DW1000.TX_POW_18DB);
+            DW1000.setDataRate(DW1000.TRX_RATE_110KBPS);
     }
     
-    // Set Transmit Power
-    // Adjust based on your hardware and regulatory requirements
-    // Format: 0xXXXXXXXX (see DW1000 datasheet for power register values)
-    DW1000.setTxPower(TX_POWER);
+    // Note: TX Power is automatically configured based on channel and PRF
+    // The library handles smart power control internally
+    // If manual power control is needed, use DW1000.useSmartPower(false) and
+    // configure power registers directly via SPI
     
     // Set this device's address (using device number)
     // Function from DW1000.h: setDeviceAddress(int16_t val)

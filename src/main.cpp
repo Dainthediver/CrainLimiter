@@ -50,7 +50,7 @@
 // ============================================================================
 // FIRMWARE VERSION
 // ============================================================================
-#define FIRMWARE_VERSION "2.2.0"
+#define FIRMWARE_VERSION "2.3.0"
 
 // ============================================================================
 // PIN CONFIGURATION
@@ -597,7 +597,9 @@ void macProcessTxDone() {
  switch (macState) {
 
  case MAC_WAIT_RESP:
- // POLL was sent (immediate), already in WAIT_RESP. Nothing extra to do.
+ // POLL was sent (immediate). Now that TX_DONE has fired,
+ // the TX_TIME register is valid — capture the timestamp here.
+ DW1000.getTransmitTimestamp(initTsPollSent);
  break;
 
  case MAC_SEND_RESP:
@@ -701,8 +703,8 @@ void macSendPoll(uint8_t target) {
 
  radioTxImmediate(txBuffer, FRAME_HEADER_LEN);
 
- // Capture POLL TX timestamp
- DW1000.getTransmitTimestamp(initTsPollSent);
+ // POLL TX timestamp will be captured in macProcessTxDone()
+ // when TX_DONE fires — reading it here before TX completes gives garbage
 
  pollsSent++;
  activePeer = target;
@@ -860,6 +862,17 @@ void rangingInitiatorCompute() {
  Serial.print("[RANGING] Invalid: ");
  Serial.print(distance, 3);
  Serial.println(" m");
+ Serial.print(" Ra=");
+ Serial.print(Ra, 3);
+ Serial.print("us Da=");
+ Serial.print(Da, 3);
+ Serial.print("us Rb=");
+ Serial.print(Rb, 3);
+ Serial.print("us Db=");
+ Serial.print(Db, 3);
+ Serial.print("us tof=");
+ Serial.print(tof, 3);
+ Serial.println("us");
  failedRanges++;
  }
 }
@@ -936,6 +949,17 @@ void rangingResponderCompute() {
  Serial.print("[RANGING] Invalid (responder): ");
  Serial.print(distance, 3);
  Serial.println(" m");
+ Serial.print(" Rb=");
+ Serial.print(Rb, 3);
+ Serial.print("us Db=");
+ Serial.print(Db, 3);
+ Serial.print("us Da=");
+ Serial.print(Da, 3);
+ Serial.print("us Ra=");
+ Serial.print(Ra, 3);
+ Serial.print("us totalInterval=");
+ Serial.print(totalInterval, 3);
+ Serial.println("us");
  }
 }
 

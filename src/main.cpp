@@ -50,7 +50,7 @@
 // ============================================================================
 // FIRMWARE VERSION
 // ============================================================================
-#define FIRMWARE_VERSION "2.3.0"
+#define FIRMWARE_VERSION "2.4.0"
 
 // ============================================================================
 // PIN CONFIGURATION
@@ -142,6 +142,7 @@ byte rxBuffer[128];
 volatile bool msgReceived = false;
 volatile bool msgSent = false;
 volatile bool txActive = false;
+volatile bool pollTxPending = false; // Set when POLL TX started, cleared when timestamp captured
 
 // ============================================================================
 // GLOBALS - MAC LAYER
@@ -599,7 +600,13 @@ void macProcessTxDone() {
  case MAC_WAIT_RESP:
  // POLL was sent (immediate). Now that TX_DONE has fired,
  // the TX_TIME register is valid — capture the timestamp here.
+ // But only if this TX_DONE is actually for our POLL, not an
+ // ANNOUNCE or other non-ranging TX that happened to complete
+ // while we're in this state.
+ if (pollTxPending) {
  DW1000.getTransmitTimestamp(initTsPollSent);
+ pollTxPending = false;
+ }
  break;
 
  case MAC_SEND_RESP:
@@ -705,6 +712,7 @@ void macSendPoll(uint8_t target) {
 
  // POLL TX timestamp will be captured in macProcessTxDone()
  // when TX_DONE fires — reading it here before TX completes gives garbage
+ pollTxPending = true; // Mark that the next TX_DONE is for our POLL
 
  pollsSent++;
  activePeer = target;
@@ -817,6 +825,15 @@ void rangingInitiatorCompute() {
  double Da = (initTsFinalSent - initTsRespRx).getAsFloat();
  double Rb = initRb;
  double Db = initDb;
+
+ // Debug: raw timestamps (in us) to diagnose timestamp capture issues
+ Serial.print("[RANGING] raw: pollSent=");
+ Serial.print(initTsPollSent.getAsFloat(), 1);
+ Serial.print("us respRx=");
+ Serial.print(initTsRespRx.getAsFloat(), 1);
+ Serial.print("us finalSent=");
+ Serial.print(initTsFinalSent.getAsFloat(), 1);
+ Serial.println("us");
 
  // Safety: all values must be positive
  if (Ra <= 0 || Da <= 0 || Rb <= 0 || Db <= 0) {

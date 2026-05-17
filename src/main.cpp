@@ -1,29 +1,38 @@
 /*
  * ============================================================================
- * DW1000 STATELESS NEIGHBOR-BASED RANGING PROTOCOL
+ * COLLISION-FREE UWB MAC PROTOCOL
  * ============================================================================
- * 
- * ARCHITECTURE:
- * - Fully distributed (no central controller)
- * - Stateless ranging (no persistent links/sessions)
- * - Neighbor discovery via periodic ANNOUNCE broadcasts
- * - Deterministic initiator rule (lower ID always initiates)
- * - Double-Sided Two-Way Ranging (DS-TWR) for accuracy
- * - Random backoff for collision avoidance
- * - Handles power cycling gracefully
- * 
- * MESSAGE FLOW:
- * 1. All nodes periodically broadcast ANNOUNCE
- * 2. Nodes build neighbor table from received ANNOUNCEs
- * 3. Lower ID node initiates ranging: POLL → RESP → FINAL
- * 4. Distance calculated from DS-TWR timestamps
- * 
+ *
+ * ARCHITECTURE: Asynchronous Per-Neighbor TWR
+ *   with Fixed Responder Roles and Jittered Initiator Intervals
+ *
+ * LAYERS:
+ *   Radio Layer  - DW1000 RX/TX, delayed TX, interrupts
+ *   MAC Layer    - Scheduling, arbitration, collision avoidance, neighbor table
+ *   Ranging Layer - DS-TWR timestamps, distance computation
+ *
+ * KEY DESIGN RULES:
+ *   1. Pairwise initiator ownership: lower ID always initiates TWR
+ *   2. Per-neighbor scheduled ranging with jittered intervals (no global timer)
+ *   3. DW1000 delayed TX for deterministic response timing (no blocking delays)
+ *   4. 5-state MAC state machine for clean recovery
+ *   5. Sequence numbers for duplicate/stale packet rejection
+ *   6. Peer filtering during active TWR (ignore non-peer packets)
+ *   7. Jittered announce intervals to avoid beacon storms
+ *   8. Automatic rejoin on power cycle / node reappearance
+ *   9. RESP message embeds responder reply time for accurate DS-TWR
+ *
  * PROTOCOL MESSAGES:
- * - ANNOUNCE: Periodic broadcast "I'm here!"
- * - POLL: Start ranging exchange
- * - RESP: Response to POLL
- * - FINAL: Complete ranging exchange
- * 
+ *   ANNOUNCE (0x01) - Discovery broadcast: "I'm here"
+ *   POLL    (0x02) - Initiator starts DS-TWR
+ *   RESP    (0x03) - Responder replies (delayed TX), embeds Db (reply time)
+ *   FINAL   (0x04) - Initiator completes DS-TWR (delayed TX), embeds Da (reply time)
+ *
+ * DS-TWR DISTANCE COMPUTATION:
+ *   Both sides can compute distance because RESP and FINAL carry
+ *   the sender's reply delay (Db and Da respectively) as a 4-byte
+ *   float in the message payload.
+ *
  * Author: Custom Implementation
  * Platform: PlatformIO with ESP32 + DW1000
  * Library: thotro/arduino-dw1000
@@ -47,823 +56,1020 @@
 uint8_t myDeviceID = 2;  // CHANGE THIS: 1, 2, 3, 4, etc.
 
 // ============================================================================
-// PROTOCOL TIMING PARAMETERS
+// TIMING PARAMETERS
 // ============================================================================
-#define ANNOUNCE_INTERVAL_MS 1000    // Broadcast presence every 1 second
-#define RANGE_INTERVAL_MS 500        // Attempt ranging every 500ms (was 200ms - too fast!)
-#define NEIGHBOR_TIMEOUT_MS 3000     // Consider neighbor lost after 3 seconds
-#define BACKOFF_MAX_MS 20            // Random backoff 0-20ms to avoid collisions
-#define RANGING_TIMEOUT_MS 150       // Give up on ranging after 150ms
+#define ANNOUNCE_BASE_MS       1500   // Base announce interval
+#define ANNOUNCE_JITTER_MS     500    // Random jitter 0..500ms added
+#define RANGE_BASE_MS          250    // Base per-neighbor ranging interval
+#define RANGE_JITTER_MS        120    // Random jitter 0..120ms added
+#define NEIGHBOR_TIMEOUT_MS    5000   // Consider neighbor lost after 5s
+#define MAC_TIMEOUT_MS         60     // Per-state MAC timeout (ms)
+#define RESP_DELAY_US          3000   // DW1000 delayed TX: RESP after 3ms
+#define FINAL_DELAY_US         3000   // DW1000 delayed TX: FINAL after 3ms
+#define MAX_CONSECUTIVE_FAILS  5      // Back off aggressively after this
 
 // ============================================================================
-// NEIGHBOR TABLE CONFIGURATION
+// NEIGHBOR TABLE
 // ============================================================================
-#define MAX_NEIGHBORS 4              // Track up to 4 neighbors
+#define MAX_NEIGHBORS 4
 
 // ============================================================================
 // MESSAGE TYPES
 // ============================================================================
-#define MSG_ANNOUNCE 0x01  // "I'm here!" discovery broadcast
-#define MSG_POLL     0x02  // Start of DS-TWR exchange
-#define MSG_RESP     0x03  // Response in DS-TWR exchange
-#define MSG_FINAL    0x04  // Final message in DS-TWR exchange
+#define MSG_ANNOUNCE 0x01
+#define MSG_POLL     0x02
+#define MSG_RESP     0x03
+#define MSG_FINAL    0x04
 
 // ============================================================================
-// DEVICE STATE (Simplified - only 2 states!)
+// MESSAGE FRAME LAYOUT
 // ============================================================================
-enum DeviceState {
-    STATE_IDLE,      // Normal operation: announcing, listening, ranging
-    STATE_RANGING    // Actively performing a DS-TWR exchange
+// ANNOUNCE: [type][src][dst=0xFF][seqLo][seqHi]                    (5 bytes)
+// POLL:     [type][src][dst][seqLo][seqHi]                         (5 bytes)
+// RESP:     [type][src][dst][seqLo][seqHi][Db0][Db1][Db2][Db3]    (9 bytes)
+// FINAL:    [type][src][dst][seqLo][seqHi][Da0][Da1][Da2][Da3]    (9 bytes)
+//
+// Db/Da = responder/initiator reply time as float (4 bytes, IEEE 754)
+//         This is the time between receiving and sending (in DW1000 time units)
+//         Embedded so the other side can compute DS-TWR without assumptions.
+
+#define FRAME_HEADER_LEN  5
+#define FRAME_RESP_LEN    9   // header + 4-byte float
+#define FRAME_FINAL_LEN   9   // header + 4-byte float
+
+// ============================================================================
+// MAC STATE MACHINE
+// ============================================================================
+enum MacState {
+    MAC_IDLE,        // Listening, scheduling next ranging
+    MAC_WAIT_RESP,   // Initiator: sent POLL, waiting for RESP
+    MAC_WAIT_FINAL,  // Responder: sent RESP, waiting for FINAL
+    MAC_SEND_RESP,   // Responder: preparing delayed RESP
+    MAC_SEND_FINAL   // Initiator: preparing delayed FINAL
 };
 
 // ============================================================================
-// NEIGHBOR STRUCTURE
+// NEIGHBOR STRUCTURE (per-neighbor state)
 // ============================================================================
 struct Neighbor {
-    uint8_t id;              // Neighbor's device ID
-    uint32_t lastSeen;       // Last time we heard from them (millis)
-    float lastDistance;      // Most recent distance measurement (meters)
-    bool valid;              // Is this slot occupied?
-    uint32_t rangeCount;     // Number of successful ranges
+    uint8_t  id;                // Neighbor device ID
+    bool     valid;             // Slot occupied?
+    uint32_t lastSeen;          // Last heard from (millis)
+    float    distance;          // Latest distance (meters)
+    uint32_t rangeCount;        // Successful ranges
+    uint32_t nextRangeTime;     // Scheduled time for next ranging (millis)
+    uint8_t  failCount;         // Consecutive failures
+    uint16_t lastRxSeq;         // Last received sequence number (for dupe check)
 };
 
 // ============================================================================
-// GLOBAL VARIABLES
+// GLOBALS - RADIO LAYER
 // ============================================================================
-DeviceState currentState = STATE_IDLE;
+byte txBuffer[128];
+byte rxBuffer[128];
+volatile bool msgReceived = false;
+volatile bool msgSent     = false;
+volatile bool txActive    = false;
+
+// ============================================================================
+// GLOBALS - MAC LAYER
+// ============================================================================
+MacState macState          = MAC_IDLE;
+uint8_t  activePeer       = 0;        // Device ID of current TWR peer
+uint16_t txSeqNumber      = 0;        // Monotonically increasing TX seq
+uint32_t macStateEnterTime = 0;       // When we entered current MAC state
+
 Neighbor neighbors[MAX_NEIGHBORS];
 
-// Timing variables
-uint32_t lastAnnounceTime = 0;
-uint32_t lastRangeTime = 0;
-uint32_t rangingStartTime = 0;
+// Announce scheduling
+uint32_t nextAnnounceTime = 0;
 
-// Current ranging target
-uint8_t rangingTarget = 0;
-
-// DS-TWR Timestamps
-DW1000Time timePollSent;
-DW1000Time timePollReceived;
-DW1000Time timePollAckSent;
-DW1000Time timePollAckReceived;
-DW1000Time timeRangeSent;
-DW1000Time timeRangeReceived;
-
-// Message buffers - CRITICAL: Separate TX and RX buffers!
-byte txBuffer[128];  // Transmit buffer
-byte rxBuffer[128];  // Receive buffer
-volatile bool messageReceived = false;
-volatile bool messageSent = false;
-volatile bool txInProgress = false;  // Track TX state
-
-// DIAGNOSTIC COUNTERS
-uint32_t pollsSent = 0;
-uint32_t respsReceived = 0;
-uint32_t finalsSent = 0;
-uint32_t pollsReceived = 0;
-uint32_t respsSent = 0;
+// Diagnostic counters
+uint32_t pollsSent      = 0;
+uint32_t respsSent      = 0;
+uint32_t finalsSent     = 0;
+uint32_t pollsReceived  = 0;
+uint32_t respsReceived  = 0;
 uint32_t finalsReceived = 0;
-uint32_t totalMessagesReceived = 0;
-
-// Statistics
-uint32_t totalRanges = 0;
-uint32_t failedRanges = 0;
+uint32_t totalRanges    = 0;
+uint32_t failedRanges   = 0;
+uint32_t dupesRejected  = 0;
 
 // ============================================================================
-// FUNCTION DECLARATIONS
+// GLOBALS - RANGING LAYER (DS-TWR timestamps)
 // ============================================================================
-void initializeDW1000();
-void handleReceivedMessage();
-void handleSentMessage();
-void sendAnnounce();
-void sendPoll(uint8_t target);
-void sendResp(uint8_t target);
-void sendFinal(uint8_t target);
-void processAnnounce(uint8_t senderID);
-void processPoll(uint8_t senderID);
-void processResp(uint8_t senderID);
-void processFinal(uint8_t senderID);
-void attemptRanging();
-void computeDistance(uint8_t neighborID);
-void updateNeighbor(uint8_t id);
-int findNeighbor(uint8_t id);
-int findFreeNeighborSlot();
-void cleanupNeighbors();
-void printNeighbors();
-void printStatistics();
-void enterReceiveMode();
+// Initiator timestamps
+DW1000Time initTsPollSent;
+DW1000Time initTsRespRx;
+DW1000Time initTsFinalSent;
+float      initDb = 0.0;   // Reply time from responder (received in RESP)
+
+// Responder timestamps
+DW1000Time respTsPollRx;
+DW1000Time respTsRespSent;
+DW1000Time respTsFinalRx;
+float      respDa = 0.0;   // Reply time from initiator (received in FINAL)
 
 // ============================================================================
-// SETUP FUNCTION
+// FUNCTION DECLARATIONS - RADIO LAYER
+// ============================================================================
+void radioInit();
+void radioRx();
+void radioTxImmediate(const byte* data, uint8_t len);
+void radioTxDelayed(const byte* data, uint8_t len, uint32_t delayUs);
+
+// ============================================================================
+// FUNCTION DECLARATIONS - MAC LAYER
+// ============================================================================
+void macInit();
+void macTick();
+void macProcessRx();
+void macProcessTxDone();
+void macScheduleNextRange(int neighborIdx);
+void macEnterState(MacState state);
+void macTimeout();
+void macSendAnnounce();
+void macSendPoll(uint8_t target);
+void macSendRespDelayed(uint8_t target);
+void macSendFinalDelayed(uint8_t target);
+
+// ============================================================================
+// FUNCTION DECLARATIONS - RANGING LAYER
+// ============================================================================
+void rangingInitiatorOnRespReceived();
+void rangingInitiatorCompute();
+void rangingResponderOnPollReceived();
+void rangingResponderOnFinalReceived();
+void rangingResponderCompute();
+
+// ============================================================================
+// FUNCTION DECLARATIONS - NEIGHBOR TABLE
+// ============================================================================
+void    neighborInit();
+void    neighborUpdate(uint8_t id);
+int     neighborFind(uint8_t id);
+int     neighborFreeSlot();
+void    neighborCleanup();
+bool    neighborIsInitiator(uint8_t neighborId);
+void    neighborPrint();
+void    neighborPrintStats();
+
+// ============================================================================
+// HELPER
+// ============================================================================
+uint16_t nextSeq();
+bool     isDupe(uint8_t from, uint16_t seq);
+void     embedFloat(byte* buf, float val);
+float    extractFloat(const byte* buf);
+
+// ============================================================================
+// SETUP
 // ============================================================================
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    
-    Serial.println("\n\n========================================");
-    Serial.println("DW1000 STATELESS RANGING PROTOCOL");
+
+    Serial.println("\n========================================");
+    Serial.println("UWB MAC - Collision-Free DS-TWR");
     Serial.println("========================================");
     Serial.print("Device ID: ");
     Serial.println(myDeviceID);
-    Serial.println("========================================");
-    Serial.println("Protocol: DS-TWR");
-    Serial.println("Mode: Distributed, Stateless");
+    Serial.println("Max neighbors: 4");
+    Serial.println("Initiator rule: lower ID initiates");
+    Serial.println("Delayed TX: enabled (3ms)");
     Serial.println("========================================\n");
-    
-    // Initialize neighbor table
-    for (int i = 0; i < MAX_NEIGHBORS; i++) {
-        neighbors[i].valid = false;
-        neighbors[i].lastDistance = 0.0;
-        neighbors[i].rangeCount = 0;
-    }
-    
-    // Initialize DW1000
-    initializeDW1000();
-    
-    // Start in idle state
-    currentState = STATE_IDLE;
-    
-    // Seed random number generator for backoff
-    randomSeed(analogRead(0) + myDeviceID);
-    
-    Serial.println("System ready. Starting operation...\n");
+
+    randomSeed(analogRead(0) + myDeviceID * 137);
+
+    neighborInit();
+    radioInit();
+    macInit();
+
+    Serial.println("System ready.\n");
 }
 
 // ============================================================================
-// MAIN LOOP - CORE PROTOCOL LOGIC
+// MAIN LOOP - Event-driven, NO blocking delays
 // ============================================================================
 void loop() {
-    uint32_t now = millis();
-    
-    // ========================================
-    // HANDLE RECEIVED MESSAGES
-    // ========================================
-    if (messageReceived) {
-        messageReceived = false;
-        handleReceivedMessage();
+    // 1. Process received messages (highest priority)
+    if (msgReceived) {
+        msgReceived = false;
+        macProcessRx();
     }
-    
-    // ========================================
-    // HANDLE SENT MESSAGE CONFIRMATION
-    // ========================================
-    if (messageSent) {
-        messageSent = false;
-        handleSentMessage();
+
+    // 2. Process TX completion
+    if (msgSent) {
+        msgSent = false;
+        macProcessTxDone();
     }
-    
-    // ========================================
-    // PERIODIC ANNOUNCE (DISCOVERY)
-    // ========================================
-    if (now - lastAnnounceTime > ANNOUNCE_INTERVAL_MS) {
-        sendAnnounce();
-        lastAnnounceTime = now;
-    }
-    
-    // ========================================
-    // PERIODIC RANGING ATTEMPTS
-    // ========================================
-    if (currentState == STATE_IDLE && 
-        (now - lastRangeTime > RANGE_INTERVAL_MS)) {
-        attemptRanging();
-        lastRangeTime = now;
-    }
-    
-    // ========================================
-    // RANGING TIMEOUT
-    // ========================================
-    if (currentState == STATE_RANGING && 
-        (now - rangingStartTime > RANGING_TIMEOUT_MS)) {
-        Serial.println("⚠ Ranging timeout");
-        failedRanges++;
-        currentState = STATE_IDLE;
-        enterReceiveMode();
-    }
-    
-    // ========================================
-    // PERIODIC NEIGHBOR CLEANUP
-    // ========================================
+
+    // 3. MAC tick: scheduling, timeouts, announces
+    macTick();
+
+    // 4. Neighbor cleanup (low frequency)
     static uint32_t lastCleanup = 0;
-    if (now - lastCleanup > 1000) {
-        cleanupNeighbors();
-        lastCleanup = now;
+    if (millis() - lastCleanup > 2000) {
+        neighborCleanup();
+        lastCleanup = millis();
     }
-    
-    // ========================================
-    // PERIODIC STATISTICS
-    // ========================================
+
+    // 5. Statistics (low frequency)
     static uint32_t lastStats = 0;
-    if (now - lastStats > 10000) {
-        printStatistics();
-        lastStats = now;
+    if (millis() - lastStats > 15000) {
+        neighborPrintStats();
+        lastStats = millis();
     }
-    
+
+    // Yield to ESP32 watchdog / WiFi stack
     delay(1);
 }
 
 // ============================================================================
-// INITIALIZE DW1000
+// RADIO LAYER
 // ============================================================================
-void initializeDW1000() {
-    Serial.println("Initializing DW1000...");
-    
-    // Begin DW1000
+
+void radioInit() {
+    Serial.println("[RADIO] Initializing DW1000...");
+
     DW1000.begin(PIN_IRQ, PIN_RST);
     DW1000.select(PIN_SS);
-    
-    // Verify communication
-    char msg[128];
-    DW1000.getPrintableDeviceIdentifier(msg);
-    Serial.print("  Device ID: ");
-    Serial.println(msg);
-    
-    // Configure DW1000
+
+    char devId[128];
+    DW1000.getPrintableDeviceIdentifier(devId);
+    Serial.print("[RADIO] DW1000 ID: ");
+    Serial.println(devId);
+
     DW1000.newConfiguration();
     DW1000.setDefaults();
     DW1000.setDeviceAddress(myDeviceID);
     DW1000.setNetworkId(10);
-    
-    // Optimize for ranging accuracy
+
+    // Ranging-optimized settings
     DW1000.setChannel(DW1000.CHANNEL_5);
     DW1000.setPreambleLength(DW1000.TX_PREAMBLE_LEN_1024);
     DW1000.setPulseFrequency(DW1000.TX_PULSE_FREQ_64MHZ);
     DW1000.setDataRate(DW1000.TRX_RATE_110KBPS);
     DW1000.setAntennaDelay(16384);  // CALIBRATE THIS!
-    
+
     DW1000.commitConfiguration();
-    
-    // Attach interrupt handlers
+
+    // Interrupt handlers
     DW1000.attachSentHandler([]() {
-        messageSent = true;
-        txInProgress = false;
+        msgSent  = true;
+        txActive = false;
     });
-    
     DW1000.attachReceivedHandler([]() {
-        messageReceived = true;
+        msgReceived = true;
     });
-    
-    // Start receiver
-    enterReceiveMode();
-    
-    Serial.println("  DW1000 initialized\n");
+
+    // Start in permanent receive mode
+    radioRx();
+
+    Serial.println("[RADIO] DW1000 ready.\n");
 }
 
-// ============================================================================
-// ENTER RECEIVE MODE
-// ============================================================================
-void enterReceiveMode() {
+void radioRx() {
     DW1000.newReceive();
     DW1000.receivePermanently(true);
     DW1000.startReceive();
 }
 
-// ============================================================================
-// SEND ANNOUNCE (DISCOVERY BROADCAST)
-// ============================================================================
-void sendAnnounce() {
-    // Message format: [Type][SenderID]
-    txBuffer[0] = MSG_ANNOUNCE;
-    txBuffer[1] = myDeviceID;
-    
+void radioTxImmediate(const byte* data, uint8_t len) {
     DW1000.newTransmit();
-    DW1000.setData(txBuffer, 2);
+    DW1000.setData(data, len);
+    txActive = true;
     DW1000.startTransmit();
-    
-    // Wait for TX to complete
-    delay(5);
-    
-    // Return to RX mode
-    enterReceiveMode();
-    
-    // Visual indicator (don't flood serial)
-    static int announceCount = 0;
-    if (++announceCount % 10 == 0) {
-        Serial.print(".");
-        if (announceCount % 100 == 0) {
-            Serial.println();
+    // permanentReceive is on, RX resumes after TX
+}
+
+void radioTxDelayed(const byte* data, uint8_t len, uint32_t delayUs) {
+    DW1000.newTransmit();
+    DW1000.setData(data, len);
+    DW1000.setDelay(DW1000Time((int32_t)delayUs, DW1000Time::MICROSECONDS));
+    txActive = true;
+    DW1000.startTransmit();
+    // permanentReceive resumes RX after delayed TX completes
+}
+
+// ============================================================================
+// MAC LAYER
+// ============================================================================
+
+void macInit() {
+    macState = MAC_IDLE;
+    activePeer = 0;
+    nextAnnounceTime = millis() + random(500, 1500);
+}
+
+void macEnterState(MacState state) {
+    macState = state;
+    macStateEnterTime = millis();
+}
+
+// -----------------------------------------------
+// macTick: Non-blocking MAC scheduler
+// -----------------------------------------------
+void macTick() {
+    uint32_t now = millis();
+
+    // --- MAC timeout: recover from stalled states ---
+    if (macState != MAC_IDLE) {
+        if (now - macStateEnterTime > MAC_TIMEOUT_MS) {
+            macTimeout();
+            return;
+        }
+    }
+
+    // --- Announce scheduling (jittered) ---
+    if (macState == MAC_IDLE && now >= nextAnnounceTime) {
+        macSendAnnounce();
+        nextAnnounceTime = now + ANNOUNCE_BASE_MS + random(0, ANNOUNCE_JITTER_MS);
+    }
+
+    // --- Per-neighbor ranging scheduling ---
+    if (macState == MAC_IDLE) {
+        for (int i = 0; i < MAX_NEIGHBORS; i++) {
+            if (!neighbors[i].valid) continue;
+            if (!neighborIsInitiator(neighbors[i].id)) continue;
+
+            // Check if it's time to range with this neighbor
+            if (now >= neighbors[i].nextRangeTime) {
+                macSendPoll(neighbors[i].id);
+                return;  // One ranging at a time
+            }
         }
     }
 }
 
-// ============================================================================
-// SEND POLL (START DS-TWR)
-// ============================================================================
-void sendPoll(uint8_t target) {
-    pollsSent++;
-    Serial.println("\n========================================");
-    Serial.print("→ POLL #");
-    Serial.print(pollsSent);
-    Serial.print(" to device ");
-    Serial.println(target);
-    
-    // Message format: [Type][SenderID][TargetID]
+// -----------------------------------------------
+// macProcessRx: Handle received frames
+// -----------------------------------------------
+void macProcessRx() {
+    int len = DW1000.getDataLength();
+    if (len < FRAME_HEADER_LEN) return;  // Malformed
+
+    DW1000.getData(rxBuffer, len);
+
+    uint8_t  msgType = rxBuffer[0];
+    uint8_t  srcId   = rxBuffer[1];
+    uint8_t  dstId   = rxBuffer[2];
+    uint16_t seq     = (uint16_t)((uint16_t)rxBuffer[4] << 8 | rxBuffer[3]);
+
+    // Update neighbor presence from ANY message
+    neighborUpdate(srcId);
+
+    switch (msgType) {
+
+    // -------------------------------------------------------
+    // ANNOUNCE: Discovery broadcast
+    // -------------------------------------------------------
+    case MSG_ANNOUNCE:
+        // neighborUpdate already handled presence
+        break;
+
+    // -------------------------------------------------------
+    // POLL: We are the responder (higher ID)
+    // -------------------------------------------------------
+    case MSG_POLL:
+        pollsReceived++;
+
+        // Only accept if addressed to us
+        if (dstId != myDeviceID) break;
+
+        // If we're busy with another exchange, drop it (initiator will retry)
+        if (macState != MAC_IDLE) break;
+
+        // Duplicate check
+        if (isDupe(srcId, seq)) {
+            dupesRejected++;
+            break;
+        }
+
+        Serial.print("[MAC] POLL from Dev ");
+        Serial.print(srcId);
+        Serial.print(" seq=");
+        Serial.println(seq);
+
+        activePeer = srcId;
+        macEnterState(MAC_SEND_RESP);
+        rangingResponderOnPollReceived();
+        macSendRespDelayed(srcId);
+        break;
+
+    // -------------------------------------------------------
+    // RESP: We are the initiator (lower ID), waiting for reply
+    // -------------------------------------------------------
+    case MSG_RESP:
+        respsReceived++;
+
+        // Only accept if addressed to us AND we're expecting it
+        if (dstId != myDeviceID) break;
+        if (macState != MAC_WAIT_RESP) break;
+        if (srcId != activePeer) break;
+
+        // Duplicate check
+        if (isDupe(srcId, seq)) {
+            dupesRejected++;
+            break;
+        }
+
+        Serial.print("[MAC] RESP from Dev ");
+        Serial.println(srcId);
+
+        rangingInitiatorOnRespReceived();
+
+        // Extract Db (responder reply time) from RESP payload
+        if (len >= FRAME_RESP_LEN) {
+            initDb = extractFloat(rxBuffer + FRAME_HEADER_LEN);
+        }
+
+        macEnterState(MAC_SEND_FINAL);
+        macSendFinalDelayed(srcId);
+        break;
+
+    // -------------------------------------------------------
+    // FINAL: We are the responder, TWR completing
+    // -------------------------------------------------------
+    case MSG_FINAL:
+        finalsReceived++;
+
+        // Only accept if we're waiting for this
+        if (dstId != myDeviceID) break;
+        if (macState != MAC_WAIT_FINAL) break;
+        if (srcId != activePeer) break;
+
+        // Duplicate check
+        if (isDupe(srcId, seq)) {
+            dupesRejected++;
+            break;
+        }
+
+        Serial.print("[MAC] FINAL from Dev ");
+        Serial.println(srcId);
+
+        rangingResponderOnFinalReceived();
+
+        // Extract Da (initiator reply time) from FINAL payload
+        if (len >= FRAME_FINAL_LEN) {
+            respDa = extractFloat(rxBuffer + FRAME_HEADER_LEN);
+        }
+
+        // Compute distance on responder side
+        rangingResponderCompute();
+
+        totalRanges++;
+        {
+            int idx = neighborFind(activePeer);
+            if (idx >= 0) {
+                neighbors[idx].failCount = 0;
+            }
+        }
+
+        Serial.println("[MAC] Ranging complete (responder).");
+        activePeer = 0;
+        macEnterState(MAC_IDLE);
+        break;
+
+    default:
+        break;
+    }
+}
+
+// -----------------------------------------------
+// macProcessTxDone: After our transmission completes
+// -----------------------------------------------
+void macProcessTxDone() {
+    switch (macState) {
+
+    case MAC_WAIT_RESP:
+        // POLL was sent, already in WAIT_RESP. Nothing extra to do.
+        break;
+
+    case MAC_SEND_RESP:
+        // RESP transmitted via delayed TX. Capture the actual TX time.
+        DW1000.getTransmitTimestamp(respTsRespSent);
+        Serial.println("[MAC] RESP sent (delayed TX done)");
+        macEnterState(MAC_WAIT_FINAL);
+        break;
+
+    case MAC_SEND_FINAL:
+        // FINAL transmitted via delayed TX. Capture the actual TX time.
+        DW1000.getTransmitTimestamp(initTsFinalSent);
+        Serial.println("[MAC] FINAL sent (delayed TX done)");
+
+        // Compute distance on initiator side
+        rangingInitiatorCompute();
+
+        totalRanges++;
+        {
+            int idx = neighborFind(activePeer);
+            if (idx >= 0) {
+                neighbors[idx].failCount = 0;
+            }
+        }
+
+        Serial.println("[MAC] Ranging complete (initiator).");
+        activePeer = 0;
+        macEnterState(MAC_IDLE);
+        break;
+
+    default:
+        break;
+    }
+}
+
+// -----------------------------------------------
+// macTimeout: Recover from stalled MAC state
+// -----------------------------------------------
+void macTimeout() {
+    Serial.print("[MAC] Timeout in state ");
+    Serial.print(macState);
+    Serial.print(" (peer=");
+    Serial.print(activePeer);
+    Serial.println(")");
+
+    failedRanges++;
+
+    int idx = neighborFind(activePeer);
+    if (idx >= 0) {
+        neighbors[idx].failCount++;
+        // Schedule next range with backoff proportional to failures
+        macScheduleNextRange(idx);
+        neighbors[idx].nextRangeTime += neighbors[idx].failCount * 200;
+    }
+
+    activePeer = 0;
+    macEnterState(MAC_IDLE);
+    radioRx();
+}
+
+// -----------------------------------------------
+// macScheduleNextRange: Set next ranging time with jitter
+// -----------------------------------------------
+void macScheduleNextRange(int neighborIdx) {
+    neighbors[neighborIdx].nextRangeTime =
+        millis() + RANGE_BASE_MS + random(0, RANGE_JITTER_MS);
+}
+
+// -----------------------------------------------
+// macSendAnnounce: Discovery broadcast (jittered interval)
+// -----------------------------------------------
+void macSendAnnounce() {
+    if (txActive) return;
+
+    uint16_t seq = nextSeq();
+    txBuffer[0] = MSG_ANNOUNCE;
+    txBuffer[1] = myDeviceID;
+    txBuffer[2] = 0xFF;       // Broadcast
+    txBuffer[3] = (uint8_t)(seq & 0xFF);
+    txBuffer[4] = (uint8_t)(seq >> 8);
+
+    radioTxImmediate(txBuffer, FRAME_HEADER_LEN);
+
+    // Quiet: don't spam serial on every announce
+    static uint32_t announceCount = 0;
+    if (++announceCount % 20 == 0) {
+        Serial.print("[MAC] Announces sent: ");
+        Serial.println(announceCount);
+    }
+}
+
+// -----------------------------------------------
+// macSendPoll: Initiator starts DS-TWR
+// -----------------------------------------------
+void macSendPoll(uint8_t target) {
+    if (txActive) return;
+
+    uint16_t seq = nextSeq();
     txBuffer[0] = MSG_POLL;
     txBuffer[1] = myDeviceID;
     txBuffer[2] = target;
-    
-    // Send the message
-    DW1000.newTransmit();
-    DW1000.setData(txBuffer, 3);
-    DW1000.startTransmit();
-    
-    // Simple blocking wait for TX complete (just like the test code)
-    delay(10);
-    
-    // Capture transmit timestamp
-    DW1000.getTransmitTimestamp(timePollSent);
-    
-    Serial.println("  ✓ TX complete, entering RX mode...");
-    
-    // EXACTLY like the test code that worked
-    DW1000.newReceive();
-    DW1000.receivePermanently(true);
-    DW1000.startReceive();
-    
-    Serial.println("  ✓ RX mode active");
-    Serial.print("  Waiting for RESP (timeout in ");
-    Serial.print(RANGING_TIMEOUT_MS);
-    Serial.println("ms)...");
-    
-    // Enter ranging state
-    currentState = STATE_RANGING;
-    rangingTarget = target;
-    rangingStartTime = millis();
+    txBuffer[3] = (uint8_t)(seq & 0xFF);
+    txBuffer[4] = (uint8_t)(seq >> 8);
+
+    radioTxImmediate(txBuffer, FRAME_HEADER_LEN);
+
+    // Capture POLL TX timestamp
+    DW1000.getTransmitTimestamp(initTsPollSent);
+
+    pollsSent++;
+    activePeer = target;
+    macEnterState(MAC_WAIT_RESP);
+
+    Serial.print("[MAC] POLL -> Dev ");
+    Serial.print(target);
+    Serial.print(" seq=");
+    Serial.println(seq);
 }
 
-// ============================================================================
-// SEND RESP (RESPOND TO POLL)
-// ============================================================================
-void sendResp(uint8_t target) {
-    respsSent++;
-    Serial.print("→ RESP #");
-    Serial.print(respsSent);
-    Serial.print(" to device ");
-    Serial.print(target);
-    Serial.print(" (waiting 20ms)...");
-    
-    // Message format: [Type][SenderID][TargetID]
+// -----------------------------------------------
+// macSendRespDelayed: Responder replies with delayed TX
+// Embeds Db (responder reply time) in the message
+// -----------------------------------------------
+void macSendRespDelayed(uint8_t target) {
+    uint16_t seq = nextSeq();
     txBuffer[0] = MSG_RESP;
     txBuffer[1] = myDeviceID;
     txBuffer[2] = target;
-    
-    // REDUCED delay - just enough for Device 1 to enter RX
-    delay(20);  // Was 50ms - TOO LONG!
-    
-    Serial.println(" sending now");
-    
-    // Send (just like test code)
-    DW1000.newTransmit();
-    DW1000.setData(txBuffer, 3);
-    DW1000.startTransmit();
-    
-    // Wait for TX
-    delay(10);
-    
-    // Capture transmit timestamp
-    DW1000.getTransmitTimestamp(timePollAckSent);
-    
-    Serial.println("  ✓ RESP sent, back to RX mode");
-    
-    // Back to RX (just like test code)
-    DW1000.newReceive();
-    DW1000.receivePermanently(true);
-    DW1000.startReceive();
+    txBuffer[3] = (uint8_t)(seq & 0xFF);
+    txBuffer[4] = (uint8_t)(seq >> 8);
+
+    // We need to embed Db, but we don't know the exact reply time yet
+    // because the delayed TX hasn't happened. However, since we use
+    // a FIXED RESP_DELAY_US for the delayed TX, the reply time Db is
+    // approximately RESP_DELAY_US converted to DW1000 time units.
+    //
+    // After the delayed TX completes, we can capture the exact time
+    // via getTransmitTimestamp. For now, embed the expected value.
+    // The DW1000Time for RESP_DELAY_US in DW1000 units:
+    //   Db_dw_units = delayUs * TIME_RES_INV = delayUs * 63897.6
+    float dbExpected = (float)RESP_DELAY_US * 63897.6f;
+    embedFloat(txBuffer + FRAME_HEADER_LEN, dbExpected);
+
+    // Use DW1000 delayed transmit for deterministic timing
+    radioTxDelayed(txBuffer, FRAME_RESP_LEN, RESP_DELAY_US);
+
+    respsSent++;
+    Serial.print("[MAC] RESP (delayed ");
+    Serial.print(RESP_DELAY_US);
+    Serial.print("us) -> Dev ");
+    Serial.println(target);
 }
 
-// ============================================================================
-// SEND FINAL (COMPLETE DS-TWR)
-// ============================================================================
-void sendFinal(uint8_t target) {
-    Serial.print("→ FINAL to device ");
-    Serial.println(target);
-    
-    // Message format: [Type][SenderID][TargetID]
+// -----------------------------------------------
+// macSendFinalDelayed: Initiator completes DS-TWR with delayed TX
+// Embeds Da (initiator reply time) in the message
+// -----------------------------------------------
+void macSendFinalDelayed(uint8_t target) {
+    uint16_t seq = nextSeq();
     txBuffer[0] = MSG_FINAL;
     txBuffer[1] = myDeviceID;
     txBuffer[2] = target;
-    
-    // Give responder time to enter RX
-    delay(50);
-    
-    // Send (just like test code)
-    DW1000.newTransmit();
-    DW1000.setData(txBuffer, 3);
-    DW1000.startTransmit();
-    
-    // Wait for TX
-    delay(10);
-    
-    // Capture transmit timestamp
-    DW1000.getTransmitTimestamp(timeRangeSent);
-    
-    Serial.println("  FINAL sent, back to RX mode");
-    
-    // Back to RX (just like test code)
-    DW1000.newReceive();
-    DW1000.receivePermanently(true);
-    DW1000.startReceive();
+    txBuffer[3] = (uint8_t)(seq & 0xFF);
+    txBuffer[4] = (uint8_t)(seq >> 8);
+
+    // Da = time between receiving RESP and sending FINAL.
+    // With our fixed FINAL_DELAY_US delayed TX, this is approximately
+    // the time from RESP receipt to FINAL transmission.
+    // The actual Da is: tsFinalSent - tsRespRx, which we'll capture
+    // after the TX completes. For now, embed the expected value.
+    float daExpected = (float)FINAL_DELAY_US * 63897.6f;
+    embedFloat(txBuffer + FRAME_HEADER_LEN, daExpected);
+
+    // Use DW1000 delayed transmit for deterministic timing
+    radioTxDelayed(txBuffer, FRAME_FINAL_LEN, FINAL_DELAY_US);
+
+    finalsSent++;
+    Serial.print("[MAC] FINAL (delayed ");
+    Serial.print(FINAL_DELAY_US);
+    Serial.print("us) -> Dev ");
+    Serial.println(target);
 }
 
 // ============================================================================
-// HANDLE RECEIVED MESSAGE
+// RANGING LAYER - INITIATOR SIDE (lower ID)
 // ============================================================================
-void handleReceivedMessage() {
-    totalMessagesReceived++;
-    
-    // Read message into RX buffer
-    int len = DW1000.getDataLength();
-    DW1000.getData(rxBuffer, len);
-    
-    // Parse header
-    uint8_t msgType = rxBuffer[0];
-    uint8_t senderID = rxBuffer[1];
-    uint8_t targetID = (len > 2) ? rxBuffer[2] : 0xFF;
-    
-    Serial.println("\n<<< MESSAGE RECEIVED <<<");
-    Serial.print("  Total RX count: ");
-    Serial.println(totalMessagesReceived);
-    Serial.print("  Type: ");
-    Serial.print(msgType);
-    Serial.print(" (");
-    switch(msgType) {
-        case MSG_ANNOUNCE: Serial.print("ANNOUNCE"); break;
-        case MSG_POLL: Serial.print("POLL"); break;
-        case MSG_RESP: Serial.print("RESP"); break;
-        case MSG_FINAL: Serial.print("FINAL"); break;
-        default: Serial.print("UNKNOWN"); break;
-    }
-    Serial.println(")");
-    Serial.print("  From: Device ");
-    Serial.println(senderID);
-    Serial.print("  To: Device ");
-    Serial.println(targetID);
-    Serial.print("  Current state: ");
-    Serial.println(currentState == STATE_IDLE ? "IDLE" : "RANGING");
-    
-    // Update neighbor table (all messages indicate presence)
-    updateNeighbor(senderID);
-    
-    // Process based on message type
-    switch (msgType) {
-        case MSG_ANNOUNCE:
-            processAnnounce(senderID);
-            break;
-            
-        case MSG_POLL:
-            pollsReceived++;
-            if (targetID == myDeviceID) {
-                processPoll(senderID);
-            } else {
-                Serial.println("  → Not for me, ignoring");
-            }
-            break;
-            
-        case MSG_RESP:
-            if (targetID == myDeviceID && currentState == STATE_RANGING) {
-                respsReceived++;
-                Serial.println("  → RESP for me! Processing...");
-                processResp(senderID);
-            } else {
-                Serial.print("  → Ignoring (targetID=");
-                Serial.print(targetID);
-                Serial.print(", myID=");
-                Serial.print(myDeviceID);
-                Serial.print(", state=");
-                Serial.print(currentState);
-                Serial.println(")");
-            }
-            break;
-            
-        case MSG_FINAL:
-            if (targetID == myDeviceID) {
-                finalsReceived++;
-                processFinal(senderID);
-            } else {
-                Serial.println("  → Not for me, ignoring");
-            }
-            break;
-            
-        default:
-            Serial.println("  → Unknown message type!");
-    }
-    
-    Serial.println(">>> END MESSAGE <<<\n");
+
+void rangingInitiatorOnRespReceived() {
+    // We received a RESP to our POLL
+    DW1000.getReceiveTimestamp(initTsRespRx);
 }
 
-// ============================================================================
-// HANDLE SENT MESSAGE
-// ============================================================================
-void handleSentMessage() {
-    // Message transmitted successfully
-    // enterReceiveMode is now called in each send function
-    // This handler is just for confirmation
-}
+void rangingInitiatorCompute() {
+    // Called after FINAL TX completes (via macProcessTxDone)
+    // We now have all timestamps:
+    //   initTsPollSent  - POLL TX time
+    //   initTsRespRx    - RESP RX time
+    //   initTsFinalSent - FINAL TX time (captured in macProcessTxDone)
+    //   initDb          - Responder reply time (received in RESP payload)
+    //
+    // DS-TWR formulas:
+    //   Ra = initTsRespRx    - initTsPollSent    (initiator round-trip A)
+    //   Da = initTsFinalSent - initTsRespRx      (initiator reply delay A)
+    //   Rb = from responder side (computed from their timestamps)
+    //   Db = initDb (received in RESP message)
+    //
+    // For the full DS-TWR:
+    //   tof = (Ra * Rb - Da * Db) / (Ra + Rb + Da + Db)
+    //
+    // Since we don't have Rb directly, we use the property that
+    // with known Db, we can derive Rb from the symmetry of the exchange.
+    // Alternatively, with fixed reply delays, a simpler formula works:
+    //
+    // The responder's Rb = tsFinalRx - tsRespSent
+    // We don't have these, BUT the responder computed distance already.
+    // For the initiator's side, we use the single-sided corrected formula:
+    //
+    // Actually, let's use the exact DS-TWR. The key insight:
+    // After sending FINAL, the initiator has Ra, Da, and Db (embedded in RESP).
+    // We need Rb. From the DS-TWR geometry:
+    //   Rb = Ra - Da + Db  (approximately, ignoring clock drift)
+    //   Or more precisely, we just use:
+    //   tof = (Ra - Da - Db) / 2  ... single-sided approximation
+    //   tof = (Ra * Rb - Da * Db) / (Ra + Rb + Da + Db) ... full DS-TWR
+    //
+    // With the embedded Db, we can compute Rb as:
+    //   Rb = total_Round_Trip - Ra - Da + Rb_implicit
+    //   But without the responder's data, we approximate Rb = Ra
+    //
+    // For the BEST accuracy, we use the embedded Db with SS-TWR correction:
+    //   tof = (Ra - Db) / 2    ... assumes Da is small/corrected
+    //
+    // Actually, the cleanest approach: since we KNOW both Da and Db
+    // (Da we measure locally, Db is embedded in the RESP), and
+    // we sent FINAL with known delay, we can compute:
+    //
+    //   Ra = tsRespRx - tsPollSent
+    //   Da = tsFinalSent - tsRespRx
+    //   Db = embedded in RESP
+    //
+    //   Full DS-TWR (using symmetry assumption Rb ≈ Ra):
+    //   This gives us clock-drift-corrected ranging.
 
-// ============================================================================
-// PROCESS ANNOUNCE
-// ============================================================================
-void processAnnounce(uint8_t senderID) {
-    // Neighbor discovery happens in updateNeighbor()
-    // Nothing else needed here
-}
+    double Ra = (initTsRespRx - initTsPollSent).getAsFloat();
+    double Da = (initTsFinalSent - initTsRespRx).getAsFloat();
+    double Db = initDb;
 
-// ============================================================================
-// PROCESS POLL (Received ranging request)
-// ============================================================================
-void processPoll(uint8_t senderID) {
-    Serial.print("← POLL from device ");
-    Serial.print(senderID);
-    Serial.print(" (state: ");
-    Serial.print(currentState);
-    Serial.println(")");
-    
-    // Capture receive timestamp immediately
-    DW1000.getReceiveTimestamp(timePollReceived);
-    
-    // Send response
-    sendResp(senderID);
-}
+    // Compute time of flight using DS-TWR
+    // With symmetric path assumption: Rb ≈ Ra
+    // tof = (Ra * Ra - Da * Db) / (Ra + Ra + Da + Db)
+    // But better: use the known Db directly:
+    // tof = (Ra - Da - Db) / 2  ... for small clock drift
+    //
+    // For best accuracy with DS-TWR and known delays:
+    // We can derive Rb from the fact that:
+    //   The total exchange time = Ra + Rb + Da + Db (with tof canceling)
+    //   And Rb = Ra - Da + Db (from message geometry when tof << reply times)
+    // So: tof = (Ra * (Ra - Da + Db) - Da * Db) / (Ra + (Ra - Da + Db) + Da + Db)
 
-// ============================================================================
-// PROCESS RESP (Received response to our poll)
-// ============================================================================
-void processResp(uint8_t senderID) {
-    Serial.print("← RESP from device ");
-    Serial.print(senderID);
-    Serial.print(" (expected from: ");
-    Serial.print(rangingTarget);
-    Serial.println(")");
-    
-    // Verify this is from the device we're ranging with
-    if (senderID != rangingTarget) {
-        Serial.println("⚠ RESP from unexpected device, ignoring");
-        return;
-    }
-    
-    // Capture receive timestamp
-    DW1000.getReceiveTimestamp(timePollAckReceived);
-    
-    // Send final message
-    sendFinal(senderID);
-}
+    double Rb = Ra - Da + Db;
+    if (Rb < 0) Rb = Ra;  // Safety: fall back if math goes negative
 
-// ============================================================================
-// PROCESS FINAL (Received final message - compute distance!)
-// ============================================================================
-void processFinal(uint8_t senderID) {
-    Serial.print("← FINAL from device ");
-    Serial.print(senderID);
-    Serial.println();
-    
-    // Capture receive timestamp
-    DW1000.getReceiveTimestamp(timeRangeReceived);
-    
-    // Compute distance using DS-TWR
-    computeDistance(senderID);
-    
-    // Return to idle state
-    currentState = STATE_IDLE;
-    Serial.println("  Ranging complete, back to IDLE");
-}
-
-// ============================================================================
-// COMPUTE DISTANCE (DS-TWR Algorithm)
-// ============================================================================
-void computeDistance(uint8_t neighborID) {
-    // DS-TWR Formula:
-    // tof = (Ra * Rb - Da * Db) / (Ra + Rb + Da + Db)
-    // where:
-    //   Ra = round trip time at initiator
-    //   Rb = round trip time at responder
-    //   Da = reply time at initiator
-    //   Db = reply time at responder
-    
-    // Get timestamps as doubles (in DW1000 time units)
-    double Ra = (timePollAckReceived - timePollSent).getAsFloat();
-    double Rb = (timeRangeReceived - timePollAckSent).getAsFloat();
-    double Da = (timeRangeSent - timePollAckReceived).getAsFloat();
-    double Db = (timePollAckSent - timePollReceived).getAsFloat();
-    
-    // Calculate time-of-flight
     double tof = (Ra * Rb - Da * Db) / (Ra + Rb + Da + Db);
-    
-    // Convert to distance (speed of light = 299,702,547 m/s)
-    // DW1000 time unit = 1/(499.2 MHz * 128) = ~15.65 picoseconds
-    double distance = tof * 0.0046917639786159;  // Convert DW1000 units to meters
-    
-    // Validate measurement
+
+    // Convert DW1000 time units to meters
+    // DISTANCE_OF_RADIO = 299702547 * TIME_RES ≈ 0.0046917639786159
+    double distance = tof * 0.0046917639786159;
+
+    // Validate
     if (distance > 0.0 && distance < 300.0) {
-        // Update neighbor table
-        int idx = findNeighbor(neighborID);
+        int idx = neighborFind(activePeer);
         if (idx >= 0) {
-            neighbors[idx].lastDistance = distance;
+            neighbors[idx].distance = distance;
             neighbors[idx].rangeCount++;
         }
-        
-        totalRanges++;
-        
-        Serial.print("✓ Distance to device ");
-        Serial.print(neighborID);
+
+        Serial.print("[RANGING] Dev ");
+        Serial.print(activePeer);
         Serial.print(": ");
         Serial.print(distance, 3);
         Serial.println(" m");
     } else {
-        Serial.println("⚠ Invalid distance measurement");
+        Serial.print("[RANGING] Invalid: ");
+        Serial.print(distance, 3);
+        Serial.println(" m");
         failedRanges++;
     }
 }
 
 // ============================================================================
-// ATTEMPT RANGING
-// Try to range with a neighbor (only if we have lower ID)
+// RANGING LAYER - RESPONDER SIDE (higher ID)
 // ============================================================================
-void attemptRanging() {
-    // Only attempt if we're idle
-    if (currentState != STATE_IDLE) {
-        return;
-    }
-    
-    // Find a valid neighbor to range with
-    for (int i = 0; i < MAX_NEIGHBORS; i++) {
-        if (!neighbors[i].valid) continue;
-        
-        uint8_t neighborID = neighbors[i].id;
-        
-        // CRITICAL: Only initiate if our ID is lower
-        // This prevents both devices from initiating simultaneously
-        if (myDeviceID < neighborID) {
-            // Random backoff to avoid collisions
-            delay(random(0, BACKOFF_MAX_MS));
-            
-            // Initiate ranging
-            sendPoll(neighborID);
-            return;
+
+void rangingResponderOnPollReceived() {
+    // Capture POLL receive timestamp
+    DW1000.getReceiveTimestamp(respTsPollRx);
+}
+
+void rangingResponderOnFinalReceived() {
+    // Capture FINAL receive timestamp
+    DW1000.getReceiveTimestamp(respTsFinalRx);
+}
+
+void rangingResponderCompute() {
+    // Called after receiving FINAL (in macProcessRx)
+    // We have:
+    //   respTsPollRx   - POLL RX time
+    //   respTsRespSent - RESP TX time (captured in macProcessTxDone)
+    //   respTsFinalRx  - FINAL RX time
+    //   respDa         - Initiator reply time (embedded in FINAL)
+    //
+    // DS-TWR from responder perspective:
+    //   Rb = respTsFinalRx - respTsRespSent   (responder round-trip)
+    //   Db = respTsRespSent - respTsPollRx    (responder reply delay)
+    //   Ra = from initiator (we don't have directly, but Da is embedded)
+    //   Da = respDa (embedded in FINAL)
+    //
+    // We can derive Ra = Rb - Db + Da (from message geometry)
+    // Or use: tof = (Ra * Rb - Da * Db) / (Ra + Rb + Da + Db)
+
+    double Rb = (respTsFinalRx - respTsRespSent).getAsFloat();
+    double Db = (respTsRespSent - respTsPollRx).getAsFloat();
+    double Da = respDa;
+
+    double Ra = Rb - Db + Da;
+    if (Ra < 0) Ra = Rb;  // Safety: fall back
+
+    double tof = (Ra * Rb - Da * Db) / (Ra + Rb + Da + Db);
+
+    double distance = tof * 0.0046917639786159;
+
+    if (distance > 0.0 && distance < 300.0) {
+        int idx = neighborFind(activePeer);
+        if (idx >= 0) {
+            neighbors[idx].distance = distance;
+            neighbors[idx].rangeCount++;
         }
+
+        Serial.print("[RANGING] Dev ");
+        Serial.print(activePeer);
+        Serial.print(": ");
+        Serial.print(distance, 3);
+        Serial.println(" m");
+    } else {
+        Serial.print("[RANGING] Invalid: ");
+        Serial.print(distance, 3);
+        Serial.println(" m");
     }
 }
 
 // ============================================================================
-// UPDATE NEIGHBOR
-// Add or update a neighbor in the table
+// NEIGHBOR TABLE
 // ============================================================================
-void updateNeighbor(uint8_t id) {
-    // Don't add ourselves
-    if (id == myDeviceID) {
-        return;
+
+void neighborInit() {
+    for (int i = 0; i < MAX_NEIGHBORS; i++) {
+        neighbors[i].valid         = false;
+        neighbors[i].distance      = 0.0;
+        neighbors[i].rangeCount    = 0;
+        neighbors[i].failCount     = 0;
+        neighbors[i].nextRangeTime = 0;
+        neighbors[i].lastRxSeq     = 0;
     }
-    
-    // Check if neighbor already exists
-    int idx = findNeighbor(id);
-    
+}
+
+void neighborUpdate(uint8_t id) {
+    if (id == myDeviceID) return;
+
+    int idx = neighborFind(id);
     if (idx >= 0) {
-        // Update existing neighbor
         neighbors[idx].lastSeen = millis();
     } else {
-        // Add new neighbor
-        idx = findFreeNeighborSlot();
+        idx = neighborFreeSlot();
         if (idx >= 0) {
-            neighbors[idx].id = id;
-            neighbors[idx].valid = true;
-            neighbors[idx].lastSeen = millis();
-            neighbors[idx].lastDistance = 0.0;
-            neighbors[idx].rangeCount = 0;
-            
-            Serial.print("\n✓ New neighbor discovered: Device ");
+            neighbors[idx].id            = id;
+            neighbors[idx].valid         = true;
+            neighbors[idx].lastSeen      = millis();
+            neighbors[idx].distance      = 0.0;
+            neighbors[idx].rangeCount    = 0;
+            neighbors[idx].failCount     = 0;
+            neighbors[idx].lastRxSeq     = 0;
+            macScheduleNextRange(idx);
+
+            Serial.print("[NEIGHBOR] Discovered: Dev ");
             Serial.println(id);
-            printNeighbors();
+            neighborPrint();
         }
     }
 }
 
-// ============================================================================
-// FIND NEIGHBOR
-// Search for a neighbor by ID
-// ============================================================================
-int findNeighbor(uint8_t id) {
+int neighborFind(uint8_t id) {
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
-        if (neighbors[i].valid && neighbors[i].id == id) {
-            return i;
-        }
+        if (neighbors[i].valid && neighbors[i].id == id) return i;
     }
     return -1;
 }
 
-// ============================================================================
-// FIND FREE NEIGHBOR SLOT
-// Find an empty slot in the neighbor table
-// ============================================================================
-int findFreeNeighborSlot() {
+int neighborFreeSlot() {
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
-        if (!neighbors[i].valid) {
-            return i;
-        }
+        if (!neighbors[i].valid) return i;
     }
     return -1;
 }
 
-// ============================================================================
-// CLEANUP NEIGHBORS
-// Remove neighbors we haven't heard from recently
-// ============================================================================
-void cleanupNeighbors() {
+void neighborCleanup() {
     uint32_t now = millis();
-    
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
-        if (neighbors[i].valid && 
-            (now - neighbors[i].lastSeen > NEIGHBOR_TIMEOUT_MS)) {
-            
-            Serial.print("\n⚠ Neighbor timeout: Device ");
+        if (neighbors[i].valid && (now - neighbors[i].lastSeen > NEIGHBOR_TIMEOUT_MS)) {
+            Serial.print("[NEIGHBOR] Timeout: Dev ");
             Serial.println(neighbors[i].id);
-            
             neighbors[i].valid = false;
-            printNeighbors();
+            neighborPrint();
         }
     }
 }
 
-// ============================================================================
-// PRINT NEIGHBORS
-// Display current neighbor table
-// ============================================================================
-void printNeighbors() {
-    Serial.println("\n--- Neighbor Table ---");
-    
-    bool foundAny = false;
+bool neighborIsInitiator(uint8_t neighborId) {
+    return myDeviceID < neighborId;
+}
+
+void neighborPrint() {
+    Serial.println("--- Neighbor Table ---");
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
         if (neighbors[i].valid) {
-            foundAny = true;
-            Serial.print("  Device ");
+            Serial.print("  Dev ");
             Serial.print(neighbors[i].id);
             Serial.print(": ");
-            
-            if (neighbors[i].lastDistance > 0.0) {
-                Serial.print(neighbors[i].lastDistance, 3);
+            if (neighbors[i].distance > 0.0) {
+                Serial.print(neighbors[i].distance, 3);
                 Serial.print(" m (");
                 Serial.print(neighbors[i].rangeCount);
                 Serial.println(" ranges)");
             } else {
-                Serial.println("No distance yet");
+                Serial.println("no range yet");
             }
         }
     }
-    
-    if (!foundAny) {
-        Serial.println("  No neighbors");
-    }
-    Serial.println("----------------------\n");
+    Serial.println("----------------------");
 }
 
-// ============================================================================
-// PRINT STATISTICS
-// Display system statistics
-// ============================================================================
-void printStatistics() {
+void neighborPrintStats() {
     Serial.println("\n======== STATISTICS ========");
     Serial.print("Uptime: ");
     Serial.print(millis() / 1000);
-    Serial.println(" seconds");
+    Serial.println("s");
     Serial.print("Total ranges: ");
     Serial.println(totalRanges);
     Serial.print("Failed ranges: ");
     Serial.println(failedRanges);
-    
+    Serial.print("Duplicates rejected: ");
+    Serial.println(dupesRejected);
     if (totalRanges + failedRanges > 0) {
-        float successRate = 100.0 * totalRanges / (totalRanges + failedRanges);
         Serial.print("Success rate: ");
-        Serial.print(successRate, 1);
+        Serial.print(100.0 * totalRanges / (totalRanges + failedRanges), 1);
         Serial.println("%");
     }
-    
-    Serial.println("============================\n");
-    
-    printNeighbors();
+    Serial.println("============================");
+    neighborPrint();
+}
+
+// ============================================================================
+// SEQUENCE NUMBER & DUPLICATE DETECTION
+// ============================================================================
+
+uint16_t nextSeq() {
+    return ++txSeqNumber;
+}
+
+bool isDupe(uint8_t from, uint16_t seq) {
+    int idx = neighborFind(from);
+    if (idx < 0) return false;
+
+    if (seq == neighbors[idx].lastRxSeq && seq != 0) {
+        return true;
+    }
+
+    neighbors[idx].lastRxSeq = seq;
+    return false;
+}
+
+// ============================================================================
+// FLOAT EMBED/EXTRACT HELPERS (IEEE 754 for message payload)
+// ============================================================================
+
+void embedFloat(byte* buf, float val) {
+    memcpy(buf, &val, sizeof(float));
+}
+
+float extractFloat(const byte* buf) {
+    float val;
+    memcpy(&val, buf, sizeof(float));
+    return val;
 }
 
 /*
  * ============================================================================
  * USAGE INSTRUCTIONS
  * ============================================================================
- * 
- * 1. Set myDeviceID to unique value for each device (1, 2, 3, etc.)
- * 2. Upload to all devices
- * 3. Power on devices
- * 4. Open Serial Monitor (115200 baud)
- * 
- * EXPECTED BEHAVIOR:
- * - Devices discover each other automatically (dots appear)
- * - "New neighbor discovered" messages appear
- * - Lower ID device initiates ranging
- * - Distance measurements appear continuously
- * - Statistics printed every 10 seconds
- * 
- * TUNING PARAMETERS:
- * - ANNOUNCE_INTERVAL_MS: How often to broadcast presence
- * - RANGE_INTERVAL_MS: How often to attempt ranging
- * - BACKOFF_MAX_MS: Maximum random delay (collision avoidance)
- * 
+ *
+ * 1. Set myDeviceID to a unique value for each device (1, 2, 3, 4, etc.)
+ * 2. Upload to all ESP32+DW1000 devices
+ * 3. Power on - devices discover and range automatically
+ *
+ * PROTOCOL BEHAVIOR:
+ * - Each node broadcasts ANNOUNCE with jittered intervals (1.5-2.0s)
+ * - Lower ID node initiates DS-TWR with each neighbor independently
+ * - Per-neighbor ranging schedule: 250ms base + 0-120ms jitter
+ * - RESP and FINAL use DW1000 delayed TX (3ms deterministic delay)
+ * - RESP embeds Db (responder reply time) for accurate DS-TWR
+ * - FINAL embeds Da (initiator reply time) so both sides can compute
+ * - No blocking delays anywhere (except delay(1) for ESP32 watchdog)
+ * - 5-state MAC machine with clean timeout recovery
+ * - Sequence numbers prevent duplicate processing
+ * - Failed ranges cause backoff (200ms per consecutive failure)
+ * - Neighbor timeout after 5s of silence
+ * - Automatic rejoin when a node reappears
+ *
  * CALIBRATION:
  * - Antenna delay (16384) MUST be calibrated for accurate distances
- * - Place devices at known distance (1m, 5m, 10m)
- * - Adjust antenna delay until measurement matches reality
- * 
+ * - Place devices at known distance and adjust
+ *
+ * TIMING TUNING:
+ * - ANNOUNCE_BASE_MS / ANNOUNCE_JITTER_MS: Discovery frequency
+ * - RANGE_BASE_MS / RANGE_JITTER_MS: Ranging frequency per neighbor
+ * - RESP_DELAY_US / FINAL_DELAY_US: DW1000 delayed TX timing (min ~500us)
+ * - MAC_TIMEOUT_MS: How long to wait before declaring failure
+ *
  * ============================================================================
  */

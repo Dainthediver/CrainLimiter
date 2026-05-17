@@ -175,8 +175,8 @@ float      respDa = 0.0;   // Reply time from initiator (received in FINAL)
 // ============================================================================
 void radioInit();
 void radioRx();
-void radioTxImmediate(const byte* data, uint8_t len);
-void radioTxDelayed(const byte* data, uint8_t len, uint32_t delayUs);
+void radioTxImmediate(byte data[], uint16_t len);
+void radioTxDelayed(byte data[], uint16_t len, uint32_t delayUs);
 
 // ============================================================================
 // FUNCTION DECLARATIONS - MAC LAYER
@@ -335,17 +335,17 @@ void radioRx() {
     DW1000.startReceive();
 }
 
-void radioTxImmediate(const byte* data, uint8_t len) {
-    DW1000.newTransmit();
-    DW1000.setData(data, len);
+void radioTxImmediate(byte data[], uint16_t len) {
+	DW1000.newTransmit();
+	DW1000.setData(data, len);
     txActive = true;
     DW1000.startTransmit();
     // permanentReceive is on, RX resumes after TX
 }
 
-void radioTxDelayed(const byte* data, uint8_t len, uint32_t delayUs) {
-    DW1000.newTransmit();
-    DW1000.setData(data, len);
+void radioTxDelayed(byte data[], uint16_t len, uint32_t delayUs) {
+	DW1000.newTransmit();
+	DW1000.setData(data, len);
     DW1000.setDelay(DW1000Time((int32_t)delayUs, DW1000Time::MICROSECONDS));
     txActive = true;
     DW1000.startTransmit();
@@ -406,10 +406,10 @@ void macTick() {
 // macProcessRx: Handle received frames
 // -----------------------------------------------
 void macProcessRx() {
-    int len = DW1000.getDataLength();
-    if (len < FRAME_HEADER_LEN) return;  // Malformed
+	uint16_t len = DW1000.getDataLength();
+	if (len < FRAME_HEADER_LEN) return; // Malformed
 
-    DW1000.getData(rxBuffer, len);
+	DW1000.getData(rxBuffer, len);
 
     uint8_t  msgType = rxBuffer[0];
     uint8_t  srcId   = rxBuffer[1];

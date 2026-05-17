@@ -175,8 +175,8 @@ float      respDa = 0.0;   // Reply time from initiator (received in FINAL)
 // ============================================================================
 void radioInit();
 void radioRx();
-void radioTxImmediate(byte data[], uint16_t len);
-void radioTxDelayed(byte data[], uint16_t len, uint32_t delayUs);
+void radioTxImmediate(const byte data[], uint16_t len);
+void radioTxDelayed(const byte data[], uint16_t len, uint32_t delayUs);
 
 // ============================================================================
 // FUNCTION DECLARATIONS - MAC LAYER
@@ -335,7 +335,7 @@ void radioRx() {
     DW1000.startReceive();
 }
 
-void radioTxImmediate(byte data[], uint16_t len) {
+void radioTxImmediate(const byte data[], uint16_t len) {
 	DW1000.newTransmit();
 	DW1000.setData(data, len);
     txActive = true;
@@ -343,13 +343,16 @@ void radioTxImmediate(byte data[], uint16_t len) {
     // permanentReceive is on, RX resumes after TX
 }
 
-void radioTxDelayed(byte data[], uint16_t len, uint32_t delayUs) {
+void radioTxDelayed(const byte data[], uint16_t len, uint32_t delayUs) {
 	DW1000.newTransmit();
 	DW1000.setData(data, len);
-    DW1000.setDelay(DW1000Time((int32_t)delayUs, DW1000Time::MICROSECONDS));
-    txActive = true;
-    DW1000.startTransmit();
-    // permanentReceive resumes RX after delayed TX completes
+	DW1000.setDelay(DW1000Time((int32_t)delayUs, DW1000Time::MICROSECONDS));
+	// Note: setDelay() stores the expected TX time internally.
+	// getTransmitTimestamp() will return it automatically (one-shot).
+	txActive = true;
+	DW1000.startTransmit();
+	// permanentReceive now handled correctly: RX restarts after
+	// delayed TX completes via the TX-done interrupt handler.
 }
 
 // ============================================================================

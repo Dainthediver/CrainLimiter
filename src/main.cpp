@@ -50,7 +50,7 @@
 // ============================================================================
 // FIRMWARE VERSION
 // ============================================================================
-#define FIRMWARE_VERSION "2.1.0"
+#define FIRMWARE_VERSION "2.2.0"
 
 // ============================================================================
 // PIN CONFIGURATION
@@ -528,8 +528,8 @@ void macProcessRx() {
 
  // Send RESULT to initiator with measured Db and Rb
  {
- float db = (respTsRespSent - respTsPollRx).getAsFloat();
- float rb = (respTsFinalRx - respTsRespSent).getAsFloat();
+ float db = (float)RESP_DELAY_US; // exact programmed delay (us)
+ float rb = (float)((respTsFinalRx - respTsPollRx).getAsFloat() - RESP_DELAY_US);
  macSendResult(srcId, db, rb);
  }
 
@@ -601,15 +601,19 @@ void macProcessTxDone() {
  break;
 
  case MAC_SEND_RESP:
- // RESP transmitted via delayed TX. Capture the actual TX timestamp.
- DW1000.getTransmitTimestamp(respTsRespSent);
+ // RESP transmitted via delayed TX.
+ // Compute RESP TX time from RX timestamp + programmed delay
+ // (more reliable than getTransmitTimestamp after delayed TX)
+ respTsRespSent = respTsPollRx + DW1000Time((int32_t)RESP_DELAY_US, DW1000Time::MICROSECONDS);
  Serial.println("[MAC] RESP sent (delayed TX done)");
  macEnterState(MAC_WAIT_FINAL);
  break;
 
  case MAC_SEND_FINAL:
- // FINAL transmitted via delayed TX. Capture the actual TX timestamp.
- DW1000.getTransmitTimestamp(initTsFinalSent);
+ // FINAL transmitted via delayed TX.
+ // Compute FINAL TX time from RX timestamp + programmed delay
+ // (more reliable than getTransmitTimestamp after delayed TX)
+ initTsFinalSent = initTsRespRx + DW1000Time((int32_t)FINAL_DELAY_US, DW1000Time::MICROSECONDS);
  Serial.println("[MAC] FINAL sent (delayed TX done)");
  // Now we wait for RESULT from the responder
  macEnterState(MAC_WAIT_RESULT);
@@ -807,6 +811,7 @@ void rangingInitiatorCompute() {
  // tof = (Ra * Rb - Da * Db) / (Ra + Rb + Da + Db)
 
  double Ra = (initTsRespRx - initTsPollSent).getAsFloat();
+ // Da = FINAL_DELAY_US by construction (initTsFinalSent = initTsRespRx + delay)
  double Da = (initTsFinalSent - initTsRespRx).getAsFloat();
  double Rb = initRb;
  double Db = initDb;
@@ -876,35 +881,28 @@ void rangingResponderOnFinalReceived() {
 void rangingResponderCompute() {
  // Called after receiving FINAL (in macProcessRx)
  // We have all responder timestamps:
- // respTsPollRx   - POLL RX time
- // respTsRespSent - RESP TX time (captured in macProcessTxDone)
- // respTsFinalRx  - FINAL RX time
+ // respTsPollRx - POLL RX time
+ // respTsRespSent - RESP TX time (computed from pollRx + programmed delay)
+ // respTsFinalRx - FINAL RX time
  //
- // From these we compute:
- // Rb = respTsFinalRx - respTsRespSent  (responder round-trip)
- // Db = respTsRespSent - respTsPollRx   (responder reply delay)
+ // Since we use programmed delayed TX, we know the exact reply delays:
+ // Db = RESP_DELAY_US (our reply delay, exact)
+ // Da = FINAL_DELAY_US (initiator's reply delay, exact)
  //
- // For full DS-TWR we also need Ra and Da from the initiator.
- // We derive them from the message geometry:
- // Ra = Rb - Db + Da   (where Da is the initiator's reply time)
+ // We derive Ra and Rb from the measured round-trip:
+ // totalInterval = respTsFinalRx - respTsPollRx (measured)
+ // Rb = totalInterval - Db (responder round-trip)
+ // Ra = Rb - Db + Da (from DS-TWR geometry)
  //
- // BUT: we don't know Da directly! We could:
- // 1. Use the symmetric assumption Da ≈ Db (works when delays are similar)
- // 2. Receive Da in a separate message (adds latency)
- // 3. Use the known delayed TX delay as an approximation
- //
- // Since we use the same RESP_DELAY_US and FINAL_DELAY_US,
- // Da ≈ Db is a reasonable approximation for the responder-side
- // computation. The initiator gets the EXACT values from RESULT,
- // so the initiator's computation is always accurate.
- //
- // For the responder's own display, we use Da ≈ Db:
- // tof = (Ra * Rb - Da * Db) / (Ra + Rb + Da + Db)
+ // The initiator gets exact values from RESULT, so its computation
+ // is always authoritative. This responder-side estimate is for
+ // local display only.
 
- double Rb = (respTsFinalRx - respTsRespSent).getAsFloat();
- double Db = (respTsRespSent - respTsPollRx).getAsFloat();
- double Da = Db; // Approximation: same delayed TX delay used
- double Ra = Rb - Db + Da; // = Rb (with Da=Db)
+ double Db = (double)RESP_DELAY_US; // our reply delay (us) - exact
+ double Da = (double)FINAL_DELAY_US; // initiator reply delay (us) - exact
+ double totalInterval = (respTsFinalRx - respTsPollRx).getAsFloat();
+ double Rb = totalInterval - Db;
+ double Ra = Rb - Db + Da;
 
  if (Ra <= 0 || Da <= 0 || Rb <= 0 || Db <= 0) {
  Serial.println("[RANGING] Invalid timestamps (responder), skipping");

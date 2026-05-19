@@ -50,7 +50,7 @@
 // ============================================================================
 // FIRMWARE VERSION
 // ============================================================================
-#define FIRMWARE_VERSION "2.4.0"
+#define FIRMWARE_VERSION "2.5.0"
 
 // ============================================================================
 // PIN CONFIGURATION
@@ -142,7 +142,6 @@ byte rxBuffer[128];
 volatile bool msgReceived = false;
 volatile bool msgSent = false;
 volatile bool txActive = false;
-volatile bool pollTxPending = false; // Set when POLL TX started, cleared when timestamp captured
 
 // ============================================================================
 // GLOBALS - MAC LAYER
@@ -600,13 +599,8 @@ void macProcessTxDone() {
  case MAC_WAIT_RESP:
  // POLL was sent (immediate). Now that TX_DONE has fired,
  // the TX_TIME register is valid — capture the timestamp here.
- // But only if this TX_DONE is actually for our POLL, not an
- // ANNOUNCE or other non-ranging TX that happened to complete
- // while we're in this state.
- if (pollTxPending) {
+ // ANNOUNCEs only fire in MAC_IDLE, so this TX_DONE must be our POLL.
  DW1000.getTransmitTimestamp(initTsPollSent);
- pollTxPending = false;
- }
  break;
 
  case MAC_SEND_RESP:
@@ -712,7 +706,6 @@ void macSendPoll(uint8_t target) {
 
  // POLL TX timestamp will be captured in macProcessTxDone()
  // when TX_DONE fires — reading it here before TX completes gives garbage
- pollTxPending = true; // Mark that the next TX_DONE is for our POLL
 
  pollsSent++;
  activePeer = target;

@@ -15,6 +15,7 @@
  * 1. Pairwise initiator ownership: lower ID always initiates TWR
  * 2. Per-neighbor scheduled ranging with jittered intervals (no global timer)
  * 3. DW1000 delayed TX for deterministic response timing (no blocking delays)
+ *    POLL: 1ms delay, RESP: 3ms delay, FINAL: 3ms delay
  * 4. 5-state MAC state machine for clean recovery
  * 5. Sequence numbers for duplicate/stale packet rejection
  * 6. Peer filtering during active TWR (ignore non-peer packets)
@@ -50,7 +51,7 @@
 // ============================================================================
 // FIRMWARE VERSION
 // ============================================================================
-#define FIRMWARE_VERSION "2.5.0"
+#define FIRMWARE_VERSION "2.6.0"
 
 // ============================================================================
 // PIN CONFIGURATION
@@ -72,8 +73,15 @@ uint8_t myDeviceID = 1; // CHANGE THIS: 1, 2, 3, 4, etc.
 #define RANGE_BASE_MS 250 // Base per-neighbor ranging interval
 #define RANGE_JITTER_MS 120 // Random jitter 0..120ms added
 #define NEIGHBOR_TIMEOUT_MS 5000 // Consider neighbor lost after 5s
-#define MAC_TIMEOUT_MS 60 // Per-state MAC timeout (ms)
-#define RESP_DELAY_US 3000 // DW1000 delayed TX: RESP after 3ms
+#define MAC_TIMEOUT_MS 80 // Per-state MAC timeout (ms) — slightly longer to account for POLL delayed TX
+// POLL_DELAY_US: Small delay for POLL delayed TX.
+// This ensures getTransmitTimestamp() returns the pre-computed _delayedTxTime
+// from the library (systemTimestamp + delay + antennaDelay), which is stored
+// in RAM and never subject to hardware register race conditions.
+// Minimum safe delayed TX on DW1000 is ~500us; we use 1000us for margin.
+#define POLL_DELAY_US 1000
+
+#define RESP_DELAY_US 3000  // DW1000 delayed TX: RESP after 3ms
 #define FINAL_DELAY_US 3000 // DW1000 delayed TX: FINAL after 3ms
 #define MAX_CONSECUTIVE_FAILS 5 // Back off aggressively after this
 
@@ -255,7 +263,7 @@ void setup() {
  Serial.println(myDeviceID);
  Serial.println("Max neighbors: 4");
  Serial.println("Initiator rule: lower ID initiates");
- Serial.println("Delayed TX: enabled (3ms)");
+ Serial.println("Delayed TX: POLL=1ms RESP=3ms FINAL=3ms");
  Serial.println("========================================\n");
 
  randomSeed(analogRead(0) + myDeviceID * 137);
@@ -271,16 +279,18 @@ void setup() {
 // MAIN LOOP - Event-driven, NO blocking delays
 // ============================================================================
 void loop() {
- // 1. Process received messages (highest priority)
- if (msgReceived) {
- msgReceived = false;
- macProcessRx();
- }
-
- // 2. Process TX completion
+ // 1. Process TX completion FIRST — capture timestamps before any
+ // RX processing can change the MAC state (e.g., POLL TX_DONE must be
+ // captured before a simultaneous RESP RX changes state to MAC_SEND_FINAL)
  if (msgSent) {
  msgSent = false;
  macProcessTxDone();
+ }
+
+ // 2. Process received messages
+ if (msgReceived) {
+ msgReceived = false;
+ macProcessRx();
  }
 
  // 3. MAC tick: scheduling, timeouts, announces
@@ -597,10 +607,14 @@ void macProcessTxDone() {
  switch (macState) {
 
  case MAC_WAIT_RESP:
- // POLL was sent (immediate). Now that TX_DONE has fired,
- // the TX_TIME register is valid — capture the timestamp here.
- // ANNOUNCEs only fire in MAC_IDLE, so this TX_DONE must be our POLL.
+ // POLL was sent via delayed TX. getTransmitTimestamp() will
+ // return the pre-computed _delayedTxTime (systemTimestamp + delay
+ // + antennaDelay), which is stored in RAM by the library.
+ // This is race-free — no hardware register read needed.
  DW1000.getTransmitTimestamp(initTsPollSent);
+ Serial.print("[MAC] POLL TX timestamp captured: ");
+ Serial.print(initTsPollSent.getAsFloat(), 1);
+ Serial.println("us");
  break;
 
  case MAC_SEND_RESP:
@@ -702,16 +716,20 @@ void macSendPoll(uint8_t target) {
  txBuffer[3] = (uint8_t)(seq & 0xFF);
  txBuffer[4] = (uint8_t)(seq >> 8);
 
- radioTxImmediate(txBuffer, FRAME_HEADER_LEN);
-
- // POLL TX timestamp will be captured in macProcessTxDone()
- // when TX_DONE fires — reading it here before TX completes gives garbage
+ // Use delayed TX so getTransmitTimestamp() returns the pre-computed
+ // _delayedTxTime from the library (RAM-stored, race-free).
+ // This eliminates the bug where the TX_TIME hardware register
+ // could return stale/wrong values when read after TX_DONE ISR
+ // has already transitioned the chip back to RX.
+ radioTxDelayed(txBuffer, FRAME_HEADER_LEN, POLL_DELAY_US);
 
  pollsSent++;
  activePeer = target;
  macEnterState(MAC_WAIT_RESP);
 
- Serial.print("[MAC] POLL -> Dev ");
+ Serial.print("[MAC] POLL (delayed ");
+ Serial.print(POLL_DELAY_US);
+ Serial.print("us) -> Dev ");
  Serial.print(target);
  Serial.print(" seq=");
  Serial.println(seq);
@@ -1150,7 +1168,7 @@ float extractFloat(const byte* buf) {
  * TIMING TUNING:
  * - ANNOUNCE_BASE_MS / ANNOUNCE_JITTER_MS: Discovery frequency
  * - RANGE_BASE_MS / RANGE_JITTER_MS: Ranging frequency per neighbor
- * - RESP_DELAY_US / FINAL_DELAY_US: DW1000 delayed TX timing (min ~500us)
+ * - POLL_DELAY_US / RESP_DELAY_US / FINAL_DELAY_US: DW1000 delayed TX timing (min ~500us)
  * - MAC_TIMEOUT_MS: How long to wait before declaring failure
  *
  * DS-TWR ACCURACY NOTES:
